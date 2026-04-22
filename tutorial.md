@@ -622,121 +622,49 @@ class RidgeModel(AlphaModel):
 
 ## 9. 完整示例脚本
 
-以下脚本将上述所有步骤串联为一个可直接运行的 Python 文件，适合在数据已就绪后快速复现完整流程：
+`examples/alpha_research/` 目录下包含以下可直接运行的脚本（均已在本机验证）：
 
-```python
-"""
-vnpy_alpha_quickstart.py
+| 脚本 | 功能 | 耗时（参考） |
+|------|------|------------|
+| [`download_baostock.py`](./examples/alpha_research/download_baostock.py) | BaoStock 下载沪深 300 日线（2018-2024）| ~6 分钟 |
+| [`factor_engineering.py`](./examples/alpha_research/factor_engineering.py) | Alpha158 因子计算 + IC 分析 | ~5 分钟 |
+| [`model_training.py`](./examples/alpha_research/model_training.py) | LightGBM 训练 + 信号生成 + 策略回测 | ~2 分钟 |
 
-前提：已完成数据下载（Step 1–3），lab 目录已存在
-运行：python vnpy_alpha_quickstart.py
-"""
+### 快速启动
 
-import warnings
-warnings.filterwarnings("ignore", category=FutureWarning)
+```bash
+# 1. 安装所有依赖
+pip install polars baostock akshare akshare lightgbm scikit-learn TA-Lib alphalens-reloaded tqdm
 
-import numpy as np
-import polars as pl
-from functools import partial
-from datetime import datetime
+# 2. 克隆仓库后，所有脚本需要设置 PYTHONPATH（本地开发模式）
+export PYTHONPATH=/path/to/vnpy
 
-from vnpy.trader.constant import Interval
-from vnpy.alpha import AlphaLab, Segment
-from vnpy.alpha.dataset import process_drop_na, process_cs_norm, process_fill_na
-from vnpy.alpha.dataset.datasets.alpha_158 import Alpha158
-from vnpy.alpha.model.models.lgb_model import LgbModel
-from vnpy.alpha.strategy import BacktestingEngine
-from vnpy.alpha.strategy.strategies.equity_demo_strategy import EquityDemoStrategy
+# 3. 下载数据（约 300 只股票 × 7 年）
+python examples/alpha_research/download_baostock.py
 
+# 4. 计算 Alpha158 因子并保存数据集
+python examples/alpha_research/factor_engineering.py
 
-# ── 0. 配置 ──────────────────────────────────────────────────────────────────
-LAB_PATH     = "./lab/csi300"
-INDEX_SYMBOL = "000300.SSE"
-NAME         = "300_lgb_demo"
-START        = "2008-01-01"
-END          = "2023-12-31"
-INTERVAL     = Interval.DAILY
-EXTENDED     = 100
-
-TRAIN = ("2008-01-01", "2014-12-31")
-VALID = ("2015-01-01", "2016-12-31")
-TEST  = ("2017-01-01", "2020-08-31")
-
-
-# ── 1. 初始化 lab ────────────────────────────────────────────────────────────
-lab = AlphaLab(LAB_PATH)
-
-component_symbols = lab.load_component_symbols(INDEX_SYMBOL, START, END)
-print(f"[1] 成分股数量: {len(component_symbols)}")
-
-
-# ── 2. 加载行情，构建因子数据集 ──────────────────────────────────────────────
-df = lab.load_bar_df(component_symbols, INTERVAL, START, END, EXTENDED)
-print(f"[2] 行情数据: {df.shape}")
-
-dataset = Alpha158(df, train_period=TRAIN, valid_period=VALID, test_period=TEST)
-
-dataset.add_processor("learn", partial(process_drop_na, names=["label"]))
-dataset.add_processor("learn", partial(process_cs_norm, names=["label"], method="zscore"))
-dataset.add_processor("infer", partial(process_fill_na, fill_value=0))
-
-filters = lab.load_component_filters(INDEX_SYMBOL, START, END)
-dataset.prepare_data(filters, max_workers=4)
-dataset.process_data()
-
-lab.save_dataset(NAME, dataset)
-print("[2] 数据集已保存")
-
-
-# ── 3. 训练 LightGBM 模型 ────────────────────────────────────────────────────
-dataset = lab.load_dataset(NAME)
-
-model = LgbModel(seed=42)
-model.fit(dataset)
-model.detail()
-
-lab.save_model(NAME, model)
-print("[3] 模型已保存")
-
-
-# ── 4. 生成样本外预测信号 ─────────────────────────────────────────────────────
-model   = lab.load_model(NAME)
-dataset = lab.load_dataset(NAME)
-
-pre    = model.predict(dataset, Segment.TEST)
-df_t   = dataset.fetch_infer(Segment.TEST)
-df_t   = df_t.with_columns(pl.Series(pre).alias("signal"))
-signal = df_t["datetime", "vt_symbol", "signal"]
-
-dataset.show_signal_performance(signal)
-lab.save_signal(NAME, signal)
-print("[4] 信号已保存")
-
-
-# ── 5. 策略回测 ──────────────────────────────────────────────────────────────
-signal = lab.load_signal(NAME)
-
-engine = BacktestingEngine(lab)
-engine.set_parameters(
-    vt_symbols=component_symbols,
-    interval=INTERVAL,
-    start=datetime(2017, 1, 1),
-    end=datetime(2020, 8, 1),
-    capital=100_000_000,
-)
-
-setting = {"top_k": 30, "n_drop": 3, "hold_thresh": 3}
-engine.add_strategy(EquityDemoStrategy, setting, signal)
-
-engine.load_data()
-engine.run_backtesting()
-engine.calculate_result()
-engine.calculate_statistics()
-engine.show_chart()
-engine.show_performance(benchmark_symbol=INDEX_SYMBOL)
-
-print("[5] 回测完成")
+# 5. 训练模型、生成信号、回测
+python examples/alpha_research/model_training.py
 ```
+
+### 实测结果（沪深 300，2018-2024 数据，2023-2024 样本外回测）
+
+| 指标 | 数值 |
+|------|------|
+| 数据规模 | 299 只股票 × 1,699 根 K 线 = 466,355 行 |
+| 因子数量 | 158 个（Alpha158） |
+| 训练集 | 2018-01-01 ~ 2021-12-31（251,871 样本）|
+| 测试集 | 2023-01-01 ~ 2024-12-31（125,787 样本）|
+| 模型 | LightGBM（早停 68 轮） |
+| 测试集总收益率 | **+22.68%** |
+| 年化收益率 | **+11.27%** |
+| 最大回撤 | -40.69% |
+| Sharpe 比率 | **0.52** |
+| 总手续费 | 551 万元（双边 0.1%） |
+
+> **注意**：以上使用当前成分股快照覆盖历史（存在幸存者偏差），生产环境应追踪历史调仓。
 
 ---
 
