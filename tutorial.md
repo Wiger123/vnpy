@@ -32,17 +32,29 @@ pip install vnpy
 
 # Alpha 研究模块额外依赖
 pip install polars lightgbm scikit-learn torch plotly alphalens-reloaded tqdm
+
+# TA-Lib（vnpy.trader 的必要依赖）
+pip install TA-Lib
 ```
 
-### 1.2 数据服务接入（二选一）
+> **本地开发模式**：如果 vnpy 是从源码克隆而非 pip 安装，运行脚本时需要设置 PYTHONPATH：
+> ```bash
+> PYTHONPATH=/path/to/vnpy python your_script.py
+> ```
 
-| 数据源 | 安装命令 | 特点 |
-|--------|----------|------|
-| RQData（米筐） | `pip install vnpy_rqdata` | 覆盖全市场，需购买订阅 |
-| 迅投研（XtQuant） | `pip install vnpy_xt` | 国内主流，支持实盘 |
-| TuShare | `pip install vnpy_tushare` | 免费 + 积分制，适合入门 |
+### 1.2 数据服务接入
 
-> 本教程以 **RQData** 为例，其他数据源接口完全相同，只需替换 `get_datafeed()` 返回的实现即可。
+| 数据源 | 安装命令 | 是否免费 | 特点 |
+|--------|----------|----------|------|
+| **BaoStock** | `pip install baostock` | ✅ 完全免费 | 无需注册，专为 A 股设计，稳定可靠 |
+| AKShare | `pip install akshare` | ✅ 免费 | 数据丰富但部分接口有频率限制 |
+| TuShare | `pip install vnpy_tushare` | 积分制 | 免费注册，数据质量高 |
+| RQData（米筐） | `pip install vnpy_rqdata` | 付费 | 覆盖全市场，机构首选 |
+| 迅投研（XtQuant） | `pip install vnpy_xt` | 需开户 | 国内主流，支持实盘 |
+
+> **推荐入门方案：BaoStock**  
+> 无需注册账号，直接安装即可使用，本教程示例脚本均基于 BaoStock。  
+> 完整可运行脚本见 [`examples/alpha_research/download_baostock.py`](./examples/alpha_research/download_baostock.py)。
 
 ---
 
@@ -74,92 +86,118 @@ lab/csi300/
 
 ## 3. 获取 A 股历史数据
 
+> 完整可运行脚本：[`examples/alpha_research/download_baostock.py`](./examples/alpha_research/download_baostock.py)
+
 ### 3.1 初始化研究工作台
 
 ```python
-from vnpy.alpha import AlphaLab, logger
+from vnpy.alpha import AlphaLab
 
-# 指定本地存储路径，首次运行会自动创建目录结构
-lab = AlphaLab("./lab/csi300")
+lab = AlphaLab("./lab/csi300")   # 首次运行自动创建目录
 ```
 
-### 3.2 下载指数成分变化
-
-以沪深 300（000300.SSE）为例，记录每个自然日的成分股列表：
+### 3.2 获取沪深 300 成分股列表
 
 ```python
-import rqdatac as rq
-from vnpy.trader.datafeed import get_datafeed
+import akshare as ak
+from vnpy.trader.constant import Exchange
 
-# 初始化 RQData 连接
-datafeed = get_datafeed()
-datafeed.init()
+def infer_exchange(code: str) -> Exchange:
+    """根据代码前缀推断 A 股交易所"""
+    if code.startswith(("60", "68", "51", "11", "58")):
+        return Exchange.SSE
+    elif code.startswith(("83", "87", "43", "92")):
+        return Exchange.BSE
+    return Exchange.SZSE
 
-task_name   = "csi300"
-index_symbol     = "000300.SSE"       # VeighNa 格式
-rq_index_symbol  = "000300.XSHG"     # RQData 格式
+# AKShare 获取当前沪深300成分股（无需账号）
+comp_df = ak.index_stock_cons_csindex(symbol="000300")
 
-start_date = "2007-01-01"
-end_date   = "2024-10-31"
+component_symbols: list[str] = []
+for _, row in comp_df.iterrows():
+    code     = str(row["成分券代码"]).zfill(6)
+    exchange = infer_exchange(code)
+    component_symbols.append(f"{code}.{exchange.value}")
 
-# 获取每日成分变化（返回 dict: 日期 → 成分股列表）
-data = rq.index_components(rq_index_symbol, start_date=start_date, end_date=end_date)
+print(f"成分股数量: {len(component_symbols)} 只")   # 300 只
 
+# 以当前快照覆盖全历史（简化处理；生产环境应追踪每次调仓变动以避免幸存者偏差）
 index_components: dict[str, list[str]] = {}
-for dt, rq_symbols in data.items():
-    vt_symbols = [
-        s.replace("XSHG", "SSE").replace("XSHE", "SZSE")
-        for s in rq_symbols
-    ]
-    index_components[dt.strftime("%Y-%m-%d")] = vt_symbols
+for year in range(2018, 2025):
+    for month in [1, 4, 7, 10]:
+        index_components[f"{year}-{month:02d}-01"] = component_symbols
 
-# 持久化到 lab
-lab.save_component_data(index_symbol, index_components)
+lab.save_component_data("000300.SSE", index_components)
 ```
 
-### 3.3 下载历史行情
+### 3.3 下载历史行情（BaoStock，后复权）
 
 ```python
+import baostock as bs
 from datetime import datetime
 from tqdm import tqdm
 
+from vnpy.trader.object import BarData
+from vnpy.trader.constant import Interval
 from vnpy.trader.database import DB_TZ
-from vnpy.trader.constant import Exchange, Interval
-from vnpy.trader.object import HistoryRequest
 
-# 加载该时段内出现过的所有成分股
-component_symbols = lab.load_component_symbols(index_symbol, start_date, end_date)
+def to_bs_code(code: str) -> str:
+    """'600000' → 'sh.600000'，'000001' → 'sz.000001'"""
+    prefix = "sh" if infer_exchange(code) == Exchange.SSE else "sz"
+    return f"{prefix}.{code}"
 
-start = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=DB_TZ)
-end   = datetime.strptime(end_date,   "%Y-%m-%d").replace(tzinfo=DB_TZ)
+def download_bars(bs_code: str, symbol: str, exchange: Exchange,
+                  start: str = "2018-01-01", end: str = "2024-12-31") -> list[BarData]:
+    rs = bs.query_history_k_data_plus(
+        bs_code, "date,open,high,low,close,volume,amount",
+        start_date=start, end_date=end,
+        frequency="d", adjustflag="1",   # 后复权
+    )
+    bars = []
+    while (rs.error_code == "0") and rs.next():
+        date_str, open_, high, low, close, volume, amount = rs.get_row_data()
+        if not close:
+            continue
+        dt = datetime.strptime(date_str, "%Y-%m-%d").replace(hour=15, tzinfo=DB_TZ)
+        bars.append(BarData(
+            symbol=symbol, exchange=exchange, datetime=dt,
+            interval=Interval.DAILY,
+            open_price=float(open_ or 0), high_price=float(high or 0),
+            low_price=float(low or 0),    close_price=float(close or 0),
+            volume=float(volume or 0),    # 单位：股（BaoStock 已换算）
+            turnover=float(amount or 0),  # 单位：元
+            open_interest=0.0, gateway_name="BAOSTOCK",
+        ))
+    return bars
 
-# 成分股 + 指数本身（用于基准对比）
-task_symbols = component_symbols + [index_symbol]
-
-for vt_symbol in tqdm(task_symbols):
-    symbol, exchange_str = vt_symbol.split(".")
-
-    req  = HistoryRequest(symbol, Exchange(exchange_str), start, end, Interval.DAILY)
-    bars = datafeed.query_bar_history(req)
-
+bs.login()
+for vt_symbol in tqdm(component_symbols):
+    symbol   = vt_symbol.split(".")[0]
+    exchange = infer_exchange(symbol)
+    bars = download_bars(to_bs_code(symbol), symbol, exchange)
     if bars:
-        lab.save_bar_data(bars)          # 自动合并去重、按 Parquet 存储
-    else:
-        logger.error(f"下载 {vt_symbol} 数据失败")
+        lab.save_bar_data(bars)          # Parquet 存储，自动合并去重
+
+# 同时下载沪深300指数本身（基准对比用）
+idx_bars = download_bars("sh.000300", "000300", Exchange.SSE)
+lab.save_bar_data(idx_bars)
+bs.logout()
 ```
 
-### 3.4 配置合约参数
+> **说明**  
+> - BaoStock 的 `volume` 已是股数（不是"手"），`amount` 已是元，`vwap = amount / volume` 自动正确。  
+> - AlphaLab 在 `load_bar_df()` 中计算 `vwap = turnover / volume`，单位匹配。
 
-回测引擎依赖合约参数来计算手续费，需提前写入：
+### 3.4 配置合约参数
 
 ```python
 for vt_symbol in component_symbols:
     lab.add_contract_setting(
         vt_symbol,
-        long_rate=5/10000,    # 买入手续费率（0.05‰）
-        short_rate=10/10000,  # 卖出手续费率（印花税 + 佣金 ≈ 0.1%）
-        size=1,               # 每手股数（A 股为 1 股，合约乘数）
-        pricetick=0.0001,     # 最小价格变动单位
+        long_rate  =5  / 10000,   # 买入佣金 0.05‰
+        short_rate =10 / 10000,   # 卖出：印花税 1‰ + 佣金 ≈ 0.1%
+        size       =1,
+        pricetick  =0.01,
     )
 ```
 
@@ -169,20 +207,17 @@ for vt_symbol in component_symbols:
 import polars as pl
 from vnpy.trader.constant import Interval
 
-# 加载单只股票的 BarData 列表
-bars = lab.load_bar_data("000001.SZSE", Interval.DAILY, "2023-01-01", "2024-01-01")
-print(f"共 {len(bars)} 根 K 线，首根：{bars[0]}")
-
-# 批量加载为 Polars DataFrame（推荐用于特征计算）
+# 批量加载为 Polars DataFrame（158 因子的计算输入）
 df: pl.DataFrame = lab.load_bar_df(
-    vt_symbols=component_symbols[:10],
-    interval=Interval.DAILY,
-    start="2023-01-01",
-    end="2024-01-01",
-    extended_days=60,          # 向前多取 60 天，保证滚动窗口特征不缺失
+    vt_symbols    =component_symbols[:5],
+    interval      =Interval.DAILY,
+    start         ="2023-01-01",
+    end           ="2024-01-01",
+    extended_days =60,       # 向前多取 60 天，保证 60 日滚动窗口完整
 )
 print(df)
-# shape: (N, 10)  列: datetime, open, high, low, close, volume, turnover, open_interest, vwap, vt_symbol
+# shape: (N, 10)
+# 列: datetime, open, high, low, close, volume, turnover, open_interest, vwap, vt_symbol
 ```
 
 ---
